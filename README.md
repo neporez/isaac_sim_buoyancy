@@ -1,6 +1,6 @@
 # isaac_sim_buoyancy
 
-![gerstner_wave_buoyancy-ezgif com-video-to-gif-converter](https://github.com/user-attachments/assets/cd0f872e-3c29-45b3-a4d0-bbd9ad95758a)
+<img width="898" height="496" alt="image" src="https://github.com/user-attachments/assets/3a4a801b-d5c4-45ae-9786-6db03b1466bb" />
 
 
 ---
