@@ -1,10 +1,11 @@
 """
-부력 물리 계산 엔진
+부력 물리 계산 엔진 (포인트 클라우드 기반)
+- 미리 수집된 샘플 포인트를 사용하여 효율적인 부력 계산
+- 최상위 RigidBody에 힘과 토크 적용
 """
 import sys
 import os
 
-# 현재 모듈의 디렉토리 찾기
 try:
     module_dir = os.path.dirname(os.path.abspath(__file__))
 except:
@@ -13,214 +14,246 @@ except:
 if module_dir not in sys.path:
     sys.path.insert(0, module_dir)
 
-import omni.usd
 from pxr import UsdGeom, Gf, Usd, UsdPhysics, PhysxSchema
 from wave_mesh import WaveMesh
 
-
 class BuoyancyPhysics:
-    """부력 물리 계산"""
-    
+    """부력 물리 계산 (포인트 클라우드 기반)"""
+
     @staticmethod
-    def get_world_scale(prim):
-        """물체의 월드 스케일 추출"""
-        xform = UsdGeom.Xformable(prim)
-        if not xform:
-            return Gf.Vec3f(1, 1, 1)
-        
-        world_transform = xform.ComputeLocalToWorldTransform(Usd.TimeCode.Default())
-        
-        scale_x = Gf.Vec3f(world_transform[0][0], world_transform[0][1], world_transform[0][2]).GetLength()
-        scale_y = Gf.Vec3f(world_transform[1][0], world_transform[1][1], world_transform[1][2]).GetLength()
-        scale_z = Gf.Vec3f(world_transform[2][0], world_transform[2][1], world_transform[2][2]).GetLength()
-        
-        return Gf.Vec3f(scale_x, scale_y, scale_z)
-    
-    @staticmethod
-    def add_physics_to_object(prim, mass):
-        """물체에 물리 속성 추가"""
-        # Rigid Body API
+    def setup_rigidbody(stage, prim_path):
+        """
+        최상위 prim에 RigidBody 설정
+        하위 콜라이더들의 mass를 자동으로 합산
+
+        Args:
+            stage: USD stage
+            prim_path: 최상위 prim 경로
+        """
+        prim = stage.GetPrimAtPath(prim_path)
+        if not prim or not prim.IsValid():
+            print(f"Error: Prim not found at {prim_path}")
+            return False
+
+        # RigidBody API (최상위에만)
         if not prim.HasAPI(UsdPhysics.RigidBodyAPI):
             rigid_body = UsdPhysics.RigidBodyAPI.Apply(prim)
             rigid_body.CreateRigidBodyEnabledAttr(True)
-        
-        # PhysX Rigid Body API
+
+        # PhysX RigidBody API
         if not prim.HasAPI(PhysxSchema.PhysxRigidBodyAPI):
             physx_rigid = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
             physx_rigid.CreateLinearDampingAttr(0.1)
             physx_rigid.CreateAngularDampingAttr(0.5)
             physx_rigid.CreateSleepThresholdAttr(0.0)
-        else:
-            physx_rigid = PhysxSchema.PhysxRigidBodyAPI(prim)
-            physx_rigid.GetLinearDampingAttr().Set(0.1)
-            physx_rigid.GetAngularDampingAttr().Set(0.5)
-        
-        # Mass API
-        if not prim.HasAPI(UsdPhysics.MassAPI):
-            mass_api = UsdPhysics.MassAPI.Apply(prim)
-            mass_api.CreateMassAttr().Set(mass)
-        else:
-            mass_api = UsdPhysics.MassAPI(prim)
-            mass_api.GetMassAttr().Set(mass)
-        
-        # Collision API
-        if not prim.HasAPI(UsdPhysics.CollisionAPI):
-            UsdPhysics.CollisionAPI.Apply(prim)
-        
-        # Force API
+
+        # ForceAPI (부력 적용용)
         if not prim.HasAPI(PhysxSchema.PhysxForceAPI):
             force_api = PhysxSchema.PhysxForceAPI.Apply(prim)
             force_api.CreateForceEnabledAttr().Set(True)
             force_api.CreateForceAttr().Set(Gf.Vec3f(0, 0, 0))
             force_api.CreateTorqueAttr().Set(Gf.Vec3f(0, 0, 0))
-            force_api.CreateModeAttr().Set("Force")
-    
+            force_api.CreateModeAttr().Set("force")
+            force_api.CreateWorldFrameEnabledAttr().Set(True)
+
+        print(f"RigidBody setup complete: {prim_path}")
+        return True
+
     @staticmethod
-    def apply_buoyancy_force(stage, buoyant_obj, time, amp, wlen, spd, steep, num_waves, debug_mode):
-        """단일 물체에 부력 적용"""
+    def apply_buoyancy_force(stage, buoyant_obj, wave_mesh_path, time,
+                              amp, wlen, spd, steep, num_waves, debug_mode=False):
+        """
+        포인트 클라우드 기반 부력 적용
+
+        Args:
+            stage: USD stage
+            buoyant_obj: BuoyantObject 인스턴스
+            wave_mesh_path: 파도 메시 경로
+            time: 현재 시간
+            amp, wlen, spd, steep, num_waves: 파도 파라미터
+            debug_mode: 디버그 출력 여부
+        """
+        if not buoyant_obj.is_initialized:
+            print(f"Warning: {buoyant_obj.prim_path} not initialized")
+            return False
+
         prim = stage.GetPrimAtPath(buoyant_obj.prim_path)
         if not prim or not prim.IsValid():
             return False
-        
-        # 물체 위치 및 크기
+
+        # Wave mesh 위치
+        wave_mesh_prim = stage.GetPrimAtPath(wave_mesh_path)
+        if not wave_mesh_prim or not wave_mesh_prim.IsValid():
+            return False
+
+        wave_mesh_xform = UsdGeom.Xformable(wave_mesh_prim)
+        wave_mesh_transform = wave_mesh_xform.ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+        wave_mesh_pos = wave_mesh_transform.ExtractTranslation()
+
+        # 무게 중심 구하기
         xform = UsdGeom.Xformable(prim)
         world_transform = xform.ComputeLocalToWorldTransform(Usd.TimeCode.Default())
-        obj_pos = world_transform.ExtractTranslation()
-        
-        bbox_cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), ['default'])
-        bbox = bbox_cache.ComputeLocalBound(prim)
-        
-        if not bbox:
-            return False
-        
-        bbox_range = bbox.GetRange()
-        min_pt = bbox_range.GetMin()
-        max_pt = bbox_range.GetMax()
-        
-        scale = BuoyancyPhysics.get_world_scale(prim)
-        
-        size = Gf.Vec3f(
-            (max_pt[0] - min_pt[0]) * scale[0],
-            (max_pt[1] - min_pt[1]) * scale[1],
-            (max_pt[2] - min_pt[2]) * scale[2]
-        )
-        
-        total_volume = abs(size[0] * size[1] * size[2])
-        
-        # 샘플 포인트 개수를 scale에 비례해서 동적 조정
-        # 각 축의 크기에 비례하되, 최소 3개, 최대 10개로 제한
-        base_samples = 3  # 최소 샘플 개수
-        max_samples = 10  # 최대 샘플 개수
-        sample_density = 0.5  # 1m당 샘플 개수 (조정 가능)
-        
-        num_samples_x = max(base_samples, min(max_samples, int(size[0] * sample_density) + base_samples))
-        num_samples_y = max(base_samples, min(max_samples, int(size[1] * sample_density) + base_samples))
-        num_samples_z = max(base_samples, min(max_samples, int(size[2] * sample_density) + base_samples))
-        
-        # 디버그 출력
-        if debug_mode:
-            print(f"\nSample grid for {buoyant_obj.prim_path}:")
-            print(f"  Size: {size[0]:.2f} x {size[1]:.2f} x {size[2]:.2f} m")
-            print(f"  Sample points: {num_samples_x} x {num_samples_y} x {num_samples_z} = {num_samples_x * num_samples_y * num_samples_z}")
-        
-        sample_points_local = []
-        
-        for i in range(num_samples_x):
-            for j in range(num_samples_y):
-                for k in range(num_samples_z):
-                    t_x = i / (num_samples_x - 1) if num_samples_x > 1 else 0.5
-                    t_y = j / (num_samples_y - 1) if num_samples_y > 1 else 0.5
-                    t_z = k / (num_samples_z - 1) if num_samples_z > 1 else 0.5
-                    
-                    local_x = min_pt[0] + (max_pt[0] - min_pt[0]) * t_x
-                    local_y = min_pt[1] + (max_pt[1] - min_pt[1]) * t_y
-                    local_z = min_pt[2] + (max_pt[2] - min_pt[2]) * t_z
-                    
-                    sample_points_local.append(Gf.Vec3d(local_x, local_y, local_z))
-        
-        # 잠긴 깊이 계산
+
+        com_local_vec = Gf.Vec3d(buoyant_obj.local_com)
+        world_com_pos = world_transform.Transform(com_local_vec)
+
+        obj_pos = Gf.Vec3f(world_com_pos[0], world_com_pos[1], world_com_pos[2])
+
+        # 로컬 포인트를 월드 좌표로 변환
+        world_points = buoyant_obj.get_world_sample_points(world_transform)
+
+        if len(world_points) == 0:
+            return True
+
+        # 잠긴 포인트 계산
+        submerged_points = []
         submerged_depths = []
-        submerged_positions = []
-        
-        for local_pt in sample_points_local:
-            world_pt = world_transform.Transform(local_pt)
-            
+
+        for world_pt in world_points:
             water_height = WaveMesh.get_water_height_at_position(
                 world_pt[0], world_pt[1], time,
-                amp, wlen, spd, steep, num_waves
+                amp, wlen, spd, steep, num_waves, wave_mesh_pos
             )
-            
+
             depth = water_height - world_pt[2]
-            
             if depth > 0:
+                submerged_points.append(world_pt)
                 submerged_depths.append(depth)
-                submerged_positions.append(Gf.Vec3f(world_pt[0], world_pt[1], world_pt[2]))
-        
-        if len(submerged_depths) == 0:
+
+        submerged_ratio = len(submerged_points) / len(world_points)
+
+        # Damping 업데이트
+        BuoyancyPhysics._update_damping(prim, submerged_ratio)
+
+        # 물 밖이면 힘 0
+        if len(submerged_points) == 0:
             force_api = PhysxSchema.PhysxForceAPI(prim)
             if force_api:
                 force_api.GetForceAttr().Set(Gf.Vec3f(0, 0, 0))
                 force_api.GetTorqueAttr().Set(Gf.Vec3f(0, 0, 0))
             return True
-        
+
         # 부력 계산
-        submerged_ratio = len(submerged_depths) / len(sample_points_local)
-        submerged_volume = total_volume * submerged_ratio
-        
-        buoyancy_center = Gf.Vec3f(0, 0, 0)
-        for pos in submerged_positions:
-            buoyancy_center += pos
-        buoyancy_center /= len(submerged_positions)
-        
+        submerged_volume = len(submerged_points) * buoyant_obj.point_volume
         buoyancy_magnitude = buoyant_obj.water_density * submerged_volume * buoyant_obj.gravity
         buoyancy_force = Gf.Vec3f(0, 0, buoyancy_magnitude)
-        
-        # 속도 및 항력
-        rigid_body_api = UsdPhysics.RigidBodyAPI(prim)
-        velocity_attr = rigid_body_api.GetVelocityAttr()
-        angular_velocity_attr = rigid_body_api.GetAngularVelocityAttr()
-        
-        current_velocity = velocity_attr.Get() if velocity_attr else Gf.Vec3f(0, 0, 0)
-        current_angular_velocity = angular_velocity_attr.Get() if angular_velocity_attr else Gf.Vec3f(0, 0, 0)
-        
-        drag_force = Gf.Vec3f(0, 0, 0)
-        if current_velocity.GetLength() > 0.01:
-            v_mag = current_velocity.GetLength()
-            v_dir = current_velocity.GetNormalized()
-            
-            reference_area = (submerged_volume ** (2.0/3.0))
-            drag_magnitude = 0.5 * buoyant_obj.water_density * (v_mag ** 2) * buoyant_obj.drag_coefficient * reference_area
-            drag_force = -v_dir * drag_magnitude
-        
+
+        # 부력 중심 계산
+        buoyancy_center = Gf.Vec3f(0, 0, 0)
+        for pt in submerged_points:
+            buoyancy_center += pt
+        buoyancy_center /= len(submerged_points)
+
+        # 항력 계산
+        drag_force = BuoyancyPhysics._calculate_drag_force(
+            prim, buoyant_obj, submerged_volume
+        )
+
         total_force = buoyancy_force + drag_force
-        
-        # 토크
+
+        # 토크 계산 (부력 중심 - 질량 중심)
         r = Gf.Vec3f(
             buoyancy_center[0] - obj_pos[0],
             buoyancy_center[1] - obj_pos[1],
             buoyancy_center[2] - obj_pos[2]
         )
-        
+
         buoyancy_torque = Gf.Vec3f(
             r[1] * buoyancy_force[2] - r[2] * buoyancy_force[1],
             r[2] * buoyancy_force[0] - r[0] * buoyancy_force[2],
             r[0] * buoyancy_force[1] - r[1] * buoyancy_force[0]
         )
-        
-        angular_drag_torque = Gf.Vec3f(0, 0, 0)
-        if current_angular_velocity.GetLength() > 0.01:
-            omega_mag = current_angular_velocity.GetLength()
-            omega_dir = current_angular_velocity.GetNormalized()
-            
-            angular_drag_magnitude = buoyant_obj.angular_drag_coefficient * omega_mag * submerged_volume
-            angular_drag_torque = -omega_dir * angular_drag_magnitude
-        
+
+        angular_drag_torque = BuoyancyPhysics._calculate_angular_drag(
+            prim, buoyant_obj, submerged_volume
+        )
+
         total_torque = buoyancy_torque + angular_drag_torque
-        
-        # 적용
+
+        # 힘 적용 (월드 좌표계)
         force_api = PhysxSchema.PhysxForceAPI(prim)
         if force_api:
+            force_api.GetWorldFrameEnabledAttr().Set(True)
             force_api.GetForceAttr().Set(total_force)
             force_api.GetTorqueAttr().Set(total_torque)
-        
+
+        # 처음 10프레임 디버그 출력
+        if not hasattr(buoyant_obj, '_debug_count'):
+            buoyant_obj._debug_count = 0
+        buoyant_obj._debug_count += 1
+
+        if debug_mode or buoyant_obj._debug_count <= 10:
+            weight = buoyant_obj.total_mass * buoyant_obj.gravity
+            print(f"\n=== BUOYANCY DEBUG [{buoyant_obj._debug_count}]: {buoyant_obj.prim_path} ===")
+            print(f"  CoM local: ({com_local_vec[0]:.2f}, {com_local_vec[1]:.2f}, {com_local_vec[2]:.2f})")
+            print(f"  CoM world: ({obj_pos[0]:.2f}, {obj_pos[1]:.2f}, {obj_pos[2]:.2f})")
+            print(f"  Buoyancy center: ({buoyancy_center[0]:.2f}, {buoyancy_center[1]:.2f}, {buoyancy_center[2]:.2f})")
+            print(f"  Submerged: {len(submerged_points)}/{len(world_points)} ({submerged_ratio:.1%})")
+            print(f"  Weight: {weight:.1f} N, Buoyancy: {buoyancy_magnitude:.1f} N (ratio: {buoyancy_magnitude/weight:.2f})")
+            print(f"  Total force: ({total_force[0]:.1f}, {total_force[1]:.1f}, {total_force[2]:.1f}) N")
+            print(f"  Total torque: ({total_torque[0]:.1f}, {total_torque[1]:.1f}, {total_torque[2]:.1f}) Nm")
+            print(f"===========================================")
+
         return True
+
+    @staticmethod
+    def _update_damping(prim, submerged_ratio):
+        """잠긴 비율에 따른 damping 업데이트"""
+        physx_rigid = PhysxSchema.PhysxRigidBodyAPI(prim)
+        if not physx_rigid:
+            return
+
+        # 공기 중 vs 물 속 damping
+        air_linear = 0.1
+        air_angular = 0.5
+        water_linear = 5.0
+        water_angular = 10.0
+
+        linear = air_linear + (water_linear - air_linear) * submerged_ratio
+        angular = air_angular + (water_angular - air_angular) * submerged_ratio
+
+        physx_rigid.GetLinearDampingAttr().Set(linear)
+        physx_rigid.GetAngularDampingAttr().Set(angular)
+
+    @staticmethod
+    def _calculate_drag_force(prim, buoyant_obj, submerged_volume):
+        """속도 기반 항력 계산"""
+        rigid_body_api = UsdPhysics.RigidBodyAPI(prim)
+        if not rigid_body_api:
+            return Gf.Vec3f(0, 0, 0)
+
+        velocity_attr = rigid_body_api.GetVelocityAttr()
+        current_velocity = velocity_attr.Get() if velocity_attr else Gf.Vec3f(0, 0, 0)
+
+        if current_velocity.GetLength() < 0.01:
+            return Gf.Vec3f(0, 0, 0)
+
+        v_mag = current_velocity.GetLength()
+        v_dir = current_velocity.GetNormalized()
+
+        reference_area = submerged_volume ** (2.0 / 3.0)
+        drag_magnitude = 0.1 * buoyant_obj.water_density * (v_mag ** 2) * \
+                         buoyant_obj.drag_coefficient * reference_area
+
+        return -v_dir * drag_magnitude
+
+    @staticmethod
+    def _calculate_angular_drag(prim, buoyant_obj, submerged_volume):
+        """각속도 기반 회전 항력 계산"""
+        rigid_body_api = UsdPhysics.RigidBodyAPI(prim)
+        if not rigid_body_api:
+            return Gf.Vec3f(0, 0, 0)
+
+        angular_velocity_attr = rigid_body_api.GetAngularVelocityAttr()
+        current_angular = angular_velocity_attr.Get() if angular_velocity_attr else Gf.Vec3f(0, 0, 0)
+
+        if current_angular.GetLength() < 0.01:
+            return Gf.Vec3f(0, 0, 0)
+
+        omega_mag = current_angular.GetLength()
+        omega_dir = current_angular.GetNormalized()
+
+        angular_drag_magnitude = 0.5 * buoyant_obj.angular_drag_coefficient * \
+                                  omega_mag * submerged_volume
+
+        return -omega_dir * angular_drag_magnitude
