@@ -3,7 +3,7 @@ Gerstner Wave 메시 생성 및 업데이트
 """
 import math
 from pxr import UsdGeom, Gf, Sdf, UsdShade
-
+import carb.settings
 
 class WaveMesh:
     """Wave Mesh 관리"""
@@ -33,10 +33,13 @@ class WaveMesh:
         mesh.GetFaceVertexCountsAttr().Set([3] * (len(faces)//3))
         mesh.GetFaceVertexIndicesAttr().Set(faces)
         
-        # Glass Material 적용
+        # ============================================
+        # Glass Material 적용 (Non-visual 속성 추가)
+        # ============================================
         material_path = "/World/Looks/GlassMaterial"
         material = UsdShade.Material.Define(stage, material_path)
         
+        # Shader 생성 (시각적 속성)
         shader = UsdShade.Shader.Define(stage, material_path + "/Shader")
         shader.CreateIdAttr("UsdPreviewSurface")
         shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set((0.9, 0.95, 1.0))
@@ -54,8 +57,31 @@ class WaveMesh:
         shader.CreateInput("displacement", Sdf.ValueTypeNames.Float).Set(0.0)
         
         material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
-        UsdShade.MaterialBindingAPI(prim).Bind(material)
         
+        # ============================================
+        # Non-visual Material 속성 추가 (LiDAR용)
+        # ============================================
+        # Prefix 확인
+        settings = carb.settings.get_settings()
+        prefix = settings.get("/rtx/materialDb/nonVisualMaterialSemantics/prefix")
+        if prefix is None:
+            prefix = "omni:simready:nonvisual"  # 기본값
+        
+        # Material Prim에 non-visual 속성 추가
+        mat_prim = stage.GetPrimAtPath(material_path)
+        
+        # 물 + 투명 속성 설정
+        mat_prim.CreateAttribute(f"{prefix}:base", 
+                                Sdf.ValueTypeNames.String).Set("water")
+        mat_prim.CreateAttribute(f"{prefix}:attributes", 
+                                Sdf.ValueTypeNames.String).Set("visually_transparent")
+        
+        print(f"Wave mesh created with glass material (non-visual: water + visually_transparent)")
+        # ============================================
+        
+        # Material 바인딩
+        UsdShade.MaterialBindingAPI(prim).Bind(material)
+
         print("Wave mesh created with glass material")
     
     @staticmethod
@@ -74,29 +100,34 @@ class WaveMesh:
         return offset_x, offset_y, offset_z
     
     @staticmethod
-    def get_water_height_at_position(x, y, time, amp, wlen, spd, steep, num_waves):
-        """특정 위치의 수면 높이 계산"""
+    def get_water_height_at_position(x, y, time, amp, wlen, spd, steep, num_waves, wave_mesh_pos):
+        """특정 위치의 수면 높이 계산 (wave mesh의 위치 반영)"""
         wave_directions = [
             (1.0, 0.0),
             (0.6, 0.8),
         ]
-        
+
+        # Wave mesh의 월드 위치를 기준으로 상대 좌표 계산
+        relative_x = x - wave_mesh_pos[0]
+        relative_y = y - wave_mesh_pos[1]
+
         total_offset_z = 0
-        
+
         for wave_idx in range(num_waves):
             direction = wave_directions[wave_idx % len(wave_directions)]
             wave_amp = amp * (1.0 - wave_idx * 0.15)
             wave_wlen = wlen * (1.0 + wave_idx * 0.3)
             wave_spd = spd * (1.0 - wave_idx * 0.1)
-            
+
             k = 2 * math.pi / wave_wlen
             omega = wave_spd * k
             dx, dy = direction
-            phase = k * (dx * x + dy * y) - omega * time
-            
+            phase = k * (dx * relative_x + dy * relative_y) - omega * time
+
             total_offset_z += wave_amp * math.sin(phase)
-        
-        return total_offset_z
+
+        # Wave mesh의 Z 위치를 더해서 절대 높이 반환
+        return total_offset_z + wave_mesh_pos[2]
     
     @staticmethod
     def update_wave_mesh(stage, mesh_path, resolution, time, amp, wlen, spd, steep, size, num_waves):
